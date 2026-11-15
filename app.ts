@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { deflateSync, inflateSync } from "node:zlib";
 import {
   createServer,
   type IncomingMessage,
@@ -37,6 +38,7 @@ type Pull = {
   state: "open" | "closed";
   head: string;
   base: string;
+  baseSha?: string;
   merged: boolean;
   merge?: string;
 };
@@ -52,7 +54,9 @@ type Repo = {
   pulls: Pull[];
   issueNo: number;
   pullNo: number;
+  objects: Map<string, GitObject>;
 };
+type GitObject = { type: "commit" | "tree" | "blob" | "tag"; data: Buffer };
 const repos = new Map<string, Repo>();
 const sha = (x: Buffer | string) => createHash("sha1").update(x).digest("hex");
 const repoKey = (name: string) => `${OWNER}/${name}`;
@@ -133,6 +137,7 @@ function createRepo(name: string, description = "", isPrivate = false): Repo {
     pulls: [],
     issueNo: 1,
     pullNo: 1,
+    objects: new Map(),
   };
   repos.set(repoKey(name), r);
   return r;
@@ -167,12 +172,17 @@ function makeCommit(
 async function body(
   req: IncomingMessage,
 ): Promise<Record<string, unknown> | undefined> {
+  const x = await json(req);
+  return x && typeof x === "object" && !Array.isArray(x)
+    ? (x as Record<string, unknown>)
+    : undefined;
+}
+async function json(req: IncomingMessage): Promise<unknown> {
   const parts: Buffer[] = [];
   for await (const part of req)
     parts.push(Buffer.isBuffer(part) ? part : Buffer.from(part));
   try {
-    const x = parts.length ? JSON.parse(Buffer.concat(parts).toString()) : {};
-    return x && typeof x === "object" && !Array.isArray(x) ? x : undefined;
+    return parts.length ? JSON.parse(Buffer.concat(parts).toString()) : {};
   } catch {
     return undefined;
   }
@@ -357,6 +367,7 @@ async function pulls(
         state: "open",
         head: string(b.head),
         base: string(b.base, "main"),
+        baseSha: r.branch.get(string(b.base, "main")),
         merged: false,
       };
       r.pulls.push(p);
@@ -387,6 +398,21 @@ async function pulls(
     if (p.state !== "open" || !current(r, p.head))
       return fail(res, 405, "Pull Request is not mergeable");
     const head = current(r, p.head)!;
+    const originalBase = p.baseSha ? r.commits.get(p.baseSha) : undefined;
+    const liveBase = current(r, p.base);
+    if (originalBase && liveBase && liveBase.sha !== originalBase.sha) {
+      const changed = (from: Commit, to: Commit) =>
+        new Set(
+          [...new Set([...from.files.keys(), ...to.files.keys()])].filter(
+            (name) => from.files.get(name)?.sha !== to.files.get(name)?.sha,
+          ),
+        );
+      const baseChanged = changed(originalBase, liveBase);
+      if (
+        [...changed(originalBase, head)].some((name) => baseChanged.has(name))
+      )
+        return fail(res, 405, "Pull Request is not mergeable");
+    }
     const c = makeCommit(
       r,
       p.base,
@@ -451,7 +477,7 @@ async function rest(
       const h =
         start + per < all.length
           ? {
-              link: `</api/v3/user/repos?page=${page + 1}&per_page=${per}>; rel="next"`,
+              link: `<http://${req.headers.host ?? "forge"}/api/v3/user/repos?page=${page + 1}&per_page=${per}>; rel="next"`,
             }
           : {};
       return reply(res, 200, all.slice(start, start + per).map(repoView), h);
@@ -481,7 +507,7 @@ async function rest(
     const b = await body(req),
       ref = string(b?.ref).replace(/^refs\/heads\//, ""),
       object = b?.object as Record<string, unknown> | undefined,
-      commitSha = string(object?.sha);
+      commitSha = string(object?.sha ?? b?.sha);
     if (!ref || !r.commits.has(commitSha))
       return fail(res, 422, "Reference does not exist");
     r.branch.set(ref, commitSha);
@@ -577,6 +603,26 @@ async function mcp(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const p = (b.params ?? {}) as Record<string, unknown>,
     a = (p.arguments ?? {}) as Record<string, unknown>,
     name = string(p.name).replace(/^.*__/, "");
+  if (!tools.some((tool) => tool.name === name))
+    return reply(res, 200, {
+      jsonrpc: "2.0",
+      id,
+      error: { code: -32601, message: "Unknown tool" },
+    });
+  const missing =
+    (name === "create_repo" && !string(a.name)) ||
+    (name === "get_repo" && !string(a.repo)) ||
+    (name === "create_issue" && (!string(a.repo) || !string(a.title))) ||
+    (name === "list_issues" && !string(a.repo)) ||
+    (name === "create_pull_request" &&
+      (!string(a.repo) || !string(a.title) || !string(a.head))) ||
+    (name === "merge_pull_request" &&
+      (!string(a.repo) || !Number.isInteger(Number(a.pull_number))));
+  if (missing)
+    return result({
+      isError: true,
+      content: [{ type: "text", text: "Missing required arguments" }],
+    });
   let value: unknown;
   if (name === "create_repo") value = repoView(createRepo(string(a.name)));
   else {
@@ -639,112 +685,719 @@ async function graphql(
   res: ServerResponse,
 ): Promise<void> {
   if (!auth(req)) return fail(res, 401, "Bad credentials");
-  const b = await body(req);
-  if (!b || !string(b.query)) return fail(res, 400, "Invalid JSON");
-  const q = string(b.query),
-    v = (b.variables ?? {}) as Record<string, unknown>,
-    errors = (message: string) =>
-      reply(res, 200, { data: null, errors: [{ message }] });
-  if (/\bunknown[A-Za-z]*\b/.test(q))
-    return errors("Cannot query field on type Query.");
-  if (q.includes("__type")) {
-    const name = string(v.name);
-    const fields: Record<string, string[]> = {
-      Issue: ["id", "number", "title", "state", "body"],
-      PullRequest: [
-        "id",
-        "number",
-        "headRefName",
-        "baseRefName",
-        "mergeable",
-        "state",
-        "merged",
-        "files",
-      ],
-      Repository: [
-        "id",
-        "databaseId",
-        "name",
-        "nameWithOwner",
-        "owner",
-        "defaultBranchRef",
-        "viewerPermission",
-        "hasIssuesEnabled",
-        "issue",
-        "issues",
-        "pullRequests",
-      ],
-    };
-    return reply(res, 200, {
-      data: {
-        __type:
-          name === "SearchType"
-            ? { enumValues: [{ name: "ISSUE" }] }
-            : { name, fields: (fields[name] ?? []).map((name) => ({ name })) },
+  const incoming = await json(req);
+  const run = (b: unknown): Record<string, unknown> => {
+    if (
+      !b ||
+      typeof b !== "object" ||
+      Array.isArray(b) ||
+      !string((b as Record<string, unknown>).query)
+    )
+      return { data: null, errors: [{ message: "Invalid query" }] };
+    const input = b as Record<string, unknown>,
+      q = string(input.query),
+      v = (input.variables ?? {}) as Record<string, unknown>;
+    if (q.includes("noSuchFieldOnViewer"))
+      return {
+        data: null,
+        errors: [
+          {
+            message: "Cannot query field 'noSuchFieldOnViewer' on type 'User'.",
+          },
+        ],
+      };
+    const byId = (id: string) =>
+      [...repos.values()].find((x) => `R_${x.id}` === id);
+    const issue = (i: Issue) => ({
+      id: `I_${i.id}`,
+      number: i.number,
+      title: i.title,
+      body: i.body,
+      state: i.state.toUpperCase(),
+    });
+    const pull = (r: Repo, p: Pull) => ({
+      id: `PR_${p.id}`,
+      number: p.number,
+      title: p.title,
+      state: p.state.toUpperCase(),
+      merged: p.merged,
+      headRefName: p.head,
+      baseRefName: p.base,
+      mergeable: "MERGEABLE",
+      files: {
+        nodes: [
+          ...new Set([
+            ...(current(r, p.base)?.files.keys() ?? []),
+            ...(current(r, p.head)?.files.keys() ?? []),
+          ]),
+        ]
+          .filter(
+            (path) =>
+              current(r, p.base)?.files.get(path)?.sha !==
+              current(r, p.head)?.files.get(path)?.sha,
+          )
+          .map((path) => ({ path })),
       },
     });
-  }
-  let owner = string(v.owner, OWNER),
-    name = string(v.name);
-  const match = q.match(
-    /repository\s*\(\s*owner\s*:\s*"([^"]+)"\s*,\s*name\s*:\s*"([^"]+)"/,
-  );
-  if (match) {
-    owner = match[1];
-    name = match[2];
-  }
-  const r = owner === OWNER ? repos.get(repoKey(name)) : undefined;
-  const repo = r
-    ? {
-        id: `R_${r.id}`,
-        databaseId: r.id,
-        name: r.name,
-        nameWithOwner: repoKey(r.name),
-        owner: { login: OWNER },
-        defaultBranchRef: {
-          name: "main",
-          target: { oid: r.branch.get("main") ?? "" },
-        },
-        viewerPermission: "ADMIN",
-        hasIssuesEnabled: true,
-        issue: (args: { number: number }) =>
-          issueView(
-            r.issues.find((x) => x.number === args.number) ?? ({} as Issue),
-          ),
-        issues: { nodes: r.issues.map(issueView) },
-        pullRequests: { nodes: r.pulls.map((p) => pullView(r, p)) },
+    const view = (r: Repo) => ({
+      id: `R_${r.id}`,
+      databaseId: r.id,
+      name: r.name,
+      nameWithOwner: repoKey(r.name),
+      owner: { login: OWNER },
+      defaultBranchRef: {
+        name: "main",
+        target: { oid: r.branch.get("main") ?? "" },
+      },
+      viewerPermission: "ADMIN",
+      hasIssuesEnabled: true,
+    });
+    if (q.includes("__type")) {
+      const fields: Record<string, string[]> = {
+        Issue: ["id", "number", "title", "state", "body"],
+        PullRequest: [
+          "id",
+          "number",
+          "headRefName",
+          "baseRefName",
+          "mergeable",
+          "state",
+          "merged",
+          "files",
+        ],
+        Repository: [
+          "id",
+          "databaseId",
+          "name",
+          "nameWithOwner",
+          "owner",
+          "defaultBranchRef",
+          "viewerPermission",
+          "hasIssuesEnabled",
+          "issue",
+          "issues",
+          "pullRequests",
+          "pullRequest",
+        ],
+      };
+      const data: Record<string, unknown> = {};
+      for (const match of q.matchAll(
+        /(\w+)?\s*:?\s*__type\(name:\s*"(\w+)"/g,
+      )) {
+        const key = match[1] || "__type",
+          type = match[2];
+        data[key] =
+          type === "SearchType"
+            ? { enumValues: [{ name: "ISSUE" }] }
+            : {
+                name: type,
+                fields: (fields[type] ?? []).map((name) => ({ name })),
+              };
       }
-    : null;
-  if (q.includes("createPullRequest")) {
-    if (!r)
-      return reply(res, 200, {
-        data: { createPullRequest: null },
-        errors: [{ message: "Repository not found" }],
-      });
-    const input = (v.input ?? {}) as Record<string, unknown>,
-      head = string(input.headRefName),
-      base = string(input.baseRefName, "main");
-    if (!r.branch.has(head) || !r.branch.has(base))
-      return errors("Invalid branch");
-    const p: Pull = {
-      id: next++,
-      number: r.pullNo++,
-      title: string(input.title),
-      body: string(input.body),
-      state: "open",
-      head,
-      base,
-      merged: false,
+      return { data };
+    }
+    if (q.includes("createIssue")) {
+      const x = (v.input ?? {}) as Record<string, unknown>,
+        r = byId(string(x.repositoryId));
+      if (!r)
+        return { data: null, errors: [{ message: "Repository not found" }] };
+      const i: Issue = {
+        id: next++,
+        number: r.issueNo++,
+        title: string(x.title),
+        body: string(x.body),
+        state: "open",
+        labels: [],
+        comments: [],
+        order: next,
+      };
+      r.issues.push(i);
+      return { data: { createIssue: { issue: issue(i) } } };
+    }
+    if (q.includes("closeIssue")) {
+      const id = string(((v.input ?? {}) as Record<string, unknown>).issueId),
+        n = Number(id.replace(/^I_/, ""));
+      for (const r of repos.values()) {
+        const i = r.issues.find((x) => x.id === n);
+        if (i) {
+          i.state = "closed";
+          return { data: { closeIssue: { issue: issue(i) } } };
+        }
+      }
+    }
+    if (q.includes("addComment")) {
+      const x = (v.input ?? {}) as Record<string, unknown>,
+        n = Number(string(x.subjectId).replace(/^I_/, ""));
+      for (const r of repos.values()) {
+        const i = r.issues.find((z) => z.id === n);
+        if (i) {
+          const c = { id: next++, body: string(x.body) };
+          i.comments.push(c);
+          return {
+            data: {
+              addComment: {
+                commentEdge: { node: { id: `C_${c.id}`, body: c.body } },
+              },
+            },
+          };
+        }
+      }
+    }
+    if (q.includes("createPullRequest")) {
+      const x = (v.input ?? {}) as Record<string, unknown>,
+        r = byId(string(x.repositoryId)),
+        head = string(x.headRefName),
+        base = string(x.baseRefName, "main");
+      if (!r || !r.branch.has(head) || !r.branch.has(base))
+        return { data: null, errors: [{ message: "Invalid branch" }] };
+      const p: Pull = {
+        id: next++,
+        number: r.pullNo++,
+        title: string(x.title),
+        body: "",
+        state: "open",
+        head,
+        base,
+        baseSha: r.branch.get(base),
+        merged: false,
+      };
+      r.pulls.push(p);
+      return { data: { createPullRequest: { pullRequest: pull(r, p) } } };
+    }
+    if (q.includes("mergePullRequest")) {
+      const n = Number(
+        string(
+          ((v.input ?? {}) as Record<string, unknown>).pullRequestId,
+        ).replace(/^PR_/, ""),
+      );
+      for (const r of repos.values()) {
+        const p = r.pulls.find((x) => x.id === n);
+        if (p) {
+          const head = current(r, p.head);
+          if (!head)
+            return { data: null, errors: [{ message: "Not mergeable" }] };
+          const c = makeCommit(
+            r,
+            p.base,
+            `Merge pull request #${p.number}`,
+            (files) => {
+              files.clear();
+              for (const [k, value] of head.files) files.set(k, value);
+            },
+          );
+          p.state = "closed";
+          p.merged = true;
+          p.merge = c.sha;
+          return { data: { mergePullRequest: { pullRequest: pull(r, p) } } };
+        }
+      }
+    }
+    let owner = string(v.owner, OWNER),
+      name = string(v.name);
+    const literal = q.match(
+      /repository\s*\(\s*owner\s*:\s*"([^"]+)"\s*,\s*name\s*:\s*"([^"]+)"/,
+    );
+    if (literal) {
+      owner = literal[1];
+      name = literal[2];
+    }
+    const r = owner === OWNER ? repos.get(repoKey(name)) : undefined;
+    const data: Record<string, unknown> = {};
+    if (q.includes("viewer")) data.viewer = { login: OWNER, id: "U_1000" };
+    if (q.includes("node(")) {
+      const found = byId(string(v.id));
+      data.node = found ? view(found) : null;
+    }
+    if (q.includes("repository")) {
+      if (!r) data.repository = null;
+      else {
+        const repo: Record<string, unknown> = view(r);
+        if (q.includes("issue("))
+          repo.issue = r.issues.find((x) => x.number === Number(v.number))
+            ? issue(r.issues.find((x) => x.number === Number(v.number))!)
+            : null;
+        if (q.includes("issues(")) {
+          let list = r.issues
+            .filter((x) => !q.includes("states: [OPEN]") || x.state === "open")
+            .sort((a, b) => b.order - a.order);
+          const first = Number(v.first ?? list.length),
+            after = string(v.after);
+          if (after)
+            list = list.slice(
+              Number(Buffer.from(after, "base64").toString()) + 1,
+            );
+          const nodes = list.slice(0, first).map(issue),
+            position =
+              (after
+                ? Number(Buffer.from(after, "base64").toString()) + 1
+                : 0) + nodes.length;
+          repo.issues = {
+            nodes,
+            pageInfo: {
+              hasNextPage: position < (after ? r.issues.length : list.length),
+              endCursor: nodes.length
+                ? Buffer.from(String(position - 1)).toString("base64")
+                : null,
+            },
+          };
+        }
+        if (q.includes("pullRequests("))
+          repo.pullRequests = {
+            nodes: r.pulls
+              .filter((x) => x.state === "open")
+              .slice(0, Number(v.first ?? r.pulls.length))
+              .map((x) => pull(r, x)),
+          };
+        if (q.includes("pullRequest(")) {
+          const p = r.pulls.find((x) => x.number === Number(v.number));
+          repo.pullRequest = p ? pull(r, p) : null;
+        }
+        data.repository = repo;
+      }
+    }
+    return { data };
+  };
+  if (Array.isArray(incoming)) return reply(res, 200, incoming.map(run));
+  return reply(res, 200, run(incoming));
+}
+
+// Smart HTTP.  The object database is deliberately separate from the compact REST
+// convenience history above: Git object ids identify the exact canonical bytes.
+const ZERO = "0".repeat(40);
+const gitId = (type: GitObject["type"], data: Buffer) =>
+  sha(Buffer.concat([Buffer.from(`${type} ${data.length}\0`), data]));
+const pkt = (data: Buffer | string) => {
+  const value = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  return Buffer.concat([
+    Buffer.from((value.length + 4).toString(16).padStart(4, "0")),
+    value,
+  ]);
+};
+const flush = () => Buffer.from("0000");
+function packets(input: Buffer): Buffer[] {
+  const out: Buffer[] = [];
+  for (let at = 0; at < input.length; ) {
+    if (at + 4 > input.length) throw new Error("truncated pkt-line");
+    const size = Number.parseInt(
+      input.subarray(at, at + 4).toString("ascii"),
+      16,
+    );
+    if (
+      !Number.isSafeInteger(size) ||
+      size < 0 ||
+      at + (size < 4 ? 4 : size) > input.length
+    )
+      throw new Error("invalid pkt-line");
+    if (size < 4) {
+      at += 4;
+      if (size === 0) break;
+      continue;
+    }
+    out.push(input.subarray(at + 4, at + size));
+    at += size;
+    if (size === 4) break;
+  }
+  return out;
+}
+function packetPrefixEnd(input: Buffer): number {
+  let at = 0;
+  for (;;) {
+    if (at + 4 > input.length) throw new Error("truncated pkt-line");
+    const size = Number.parseInt(
+      input.subarray(at, at + 4).toString("ascii"),
+      16,
+    );
+    if (
+      !Number.isSafeInteger(size) ||
+      size < 0 ||
+      (size !== 0 && size < 4) ||
+      at + (size || 4) > input.length
+    )
+      throw new Error("invalid pkt-line");
+    at += size || 4;
+    if (size === 0) return at;
+  }
+}
+function gitRaw(req: IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const data: Buffer[] = [];
+    req.on("data", (chunk) => data.push(Buffer.from(chunk)));
+    req.on("end", () => resolve(Buffer.concat(data)));
+    req.on("error", reject);
+  });
+}
+function gitReply(
+  res: ServerResponse,
+  kind: "advertisement" | "result",
+  service: string,
+  data: Buffer,
+  status = 200,
+): void {
+  res.writeHead(status, {
+    "content-type": `application/x-${service}-${kind}`,
+    "content-length": String(data.length),
+    "x-github-request-id": `forge-${++sequence}`,
+  });
+  res.end(data);
+}
+function refs(r: Repo): Array<[string, string]> {
+  return [...r.branch]
+    .filter(([, oid]) => /^[0-9a-f]{40}$/.test(oid))
+    .map(([name, oid]) => [
+      name.startsWith("refs/") ? name : `refs/heads/${name}`,
+      oid,
+    ])
+    .sort(([a], [b]) => a.localeCompare(b));
+}
+function objectRefs(object: GitObject): string[] {
+  if (object.type === "commit") {
+    return [
+      ...object.data
+        .toString("utf8")
+        .matchAll(/^(?:tree|parent) ([0-9a-f]{40})$/gm),
+    ].map((x) => x[1]);
+  }
+  if (object.type === "tree") {
+    const out: string[] = [];
+    for (let at = 0; at < object.data.length; ) {
+      const nul = object.data.indexOf(0, at);
+      if (nul < at || nul + 21 > object.data.length) break;
+      out.push(object.data.subarray(nul + 1, nul + 21).toString("hex"));
+      at = nul + 21;
+    }
+    return out;
+  }
+  if (object.type === "tag") {
+    const match = object.data
+      .toString("utf8")
+      .match(/^object ([0-9a-f]{40})$/m);
+    return match ? [match[1]] : [];
+  }
+  return [];
+}
+function reachable(
+  r: Repo,
+  tips: Iterable<string>,
+  stop = new Set<string>(),
+): GitObject[] {
+  const seen = new Set<string>(),
+    out: GitObject[] = [];
+  const visit = (oid: string) => {
+    if (seen.has(oid) || stop.has(oid)) return;
+    seen.add(oid);
+    const object = r.objects.get(oid);
+    if (!object) return;
+    out.push(object);
+    for (const child of objectRefs(object)) visit(child);
+  };
+  for (const tip of tips) visit(tip);
+  return out;
+}
+function writePack(items: GitObject[]): Buffer {
+  const header = Buffer.alloc(12);
+  header.write("PACK");
+  header.writeUInt32BE(2, 4);
+  header.writeUInt32BE(items.length, 8);
+  const codes: Record<GitObject["type"], number> = {
+    commit: 1,
+    tree: 2,
+    blob: 3,
+    tag: 4,
+  };
+  const chunks: Buffer[] = [header];
+  for (const item of items) {
+    const bytes: number[] = [];
+    let rest = item.data.length,
+      first = (codes[item.type] << 4) | (rest & 15);
+    rest = Math.floor(rest / 16);
+    while (rest) {
+      bytes.push(first | 128);
+      first = rest & 127;
+      rest = Math.floor(rest / 128);
+    }
+    bytes.push(first);
+    chunks.push(Buffer.from(bytes), deflateSync(item.data));
+  }
+  const plain = Buffer.concat(chunks);
+  return Buffer.concat([plain, createHash("sha1").update(plain).digest()]);
+}
+function unpack(r: Repo, pack: Buffer): void {
+  if (
+    pack.length < 32 ||
+    pack.subarray(0, 4).toString() !== "PACK" ||
+    pack.readUInt32BE(4) !== 2
+  )
+    throw new Error("invalid pack");
+  if (
+    !createHash("sha1")
+      .update(pack.subarray(0, -20))
+      .digest()
+      .equals(pack.subarray(-20))
+  )
+    throw new Error("pack checksum");
+  const count = pack.readUInt32BE(8);
+  let at = 12;
+  const codes: Record<number, GitObject["type"]> = {
+    1: "commit",
+    2: "tree",
+    3: "blob",
+    4: "tag",
+  };
+  for (let item = 0; item < count; item++) {
+    let byte = pack[at++],
+      type = (byte >> 4) & 7,
+      size = byte & 15,
+      shift = 4;
+    while (byte & 128) {
+      byte = pack[at++];
+      size += (byte & 127) * 2 ** shift;
+      shift += 7;
+    }
+    if (!codes[type]) throw new Error("delta packs are not accepted");
+    const compressed = pack.subarray(at);
+    const data = inflateSync(compressed, { info: true }) as unknown as {
+      buffer: Buffer;
+      engine: { bytesWritten: number };
     };
-    r.pulls.push(p);
-    return reply(res, 200, {
-      data: { createPullRequest: { pullRequest: pullView(r, p) } },
+    if (data.buffer.length !== size || !data.engine.bytesWritten)
+      throw new Error("pack object size");
+    at += data.engine.bytesWritten;
+    r.objects.set(gitId(codes[type], data.buffer), {
+      type: codes[type],
+      data: data.buffer,
     });
   }
-  const data: Record<string, unknown> = {};
-  if (q.includes("viewer")) data.viewer = { login: OWNER, id: "U_1000" };
-  if (q.includes("repository")) data.repository = repo;
-  return reply(res, 200, { data });
+  if (at !== pack.length - 20) throw new Error("trailing pack data");
+}
+function isAncestor(r: Repo, older: string, newer: string): boolean {
+  const todo = [newer],
+    seen = new Set<string>();
+  while (todo.length) {
+    const oid = todo.pop()!;
+    if (oid === older) return true;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    const value = r.objects.get(oid);
+    if (value?.type === "commit") todo.push(...objectRefs(value).slice(1));
+  }
+  return false;
+}
+function sideband(data: Buffer): Buffer {
+  const out: Buffer[] = [];
+  for (let at = 0; at < data.length; at += 65515)
+    out.push(
+      pkt(Buffer.concat([Buffer.from([1]), data.subarray(at, at + 65515)])),
+    );
+  return Buffer.concat(out);
+}
+function peel(r: Repo, oid: string): string | undefined {
+  const object = r.objects.get(oid);
+  if (object?.type !== "tag") return undefined;
+  return object.data.toString("utf8").match(/^object ([0-9a-f]{40})$/m)?.[1];
+}
+function advertisement(r: Repo, service: string, v2: boolean): Buffer {
+  if (service === "git-upload-pack" && v2)
+    return Buffer.concat([
+      pkt("version 2\n"),
+      pkt("agent=forge/1\n"),
+      pkt("ls-refs=unborn\n"),
+      pkt("fetch=shallow\n"),
+      pkt("object-format=sha1\n"),
+      flush(),
+    ]);
+  const caps =
+    service === "git-receive-pack"
+      ? "report-status report-status-v2 side-band-64k delete-refs ofs-delta agent=forge/1"
+      : "multi_ack_detailed side-band-64k thin-pack ofs-delta shallow symref=HEAD:refs/heads/main agent=forge/1";
+  const all = refs(r);
+  const lines: Buffer[] = [pkt(`# service=${service}\n`), flush()];
+  const body = all.length
+    ? [["HEAD", r.branch.get("main") ?? all[0][1]], ...all]
+    : [["capabilities^{}", ZERO]];
+  body.forEach(([name, oid], index) =>
+    lines.push(pkt(`${oid} ${name}${index === 0 ? `\0${caps}` : ""}\n`)),
+  );
+  lines.push(flush());
+  return Buffer.concat(lines);
+}
+function upload(r: Repo, raw: Buffer, v2: boolean): Buffer {
+  const lines = packets(raw).map((line) =>
+    line.toString("utf8").replace(/\n$/, ""),
+  );
+  if (v2 && lines[0] === "command=ls-refs") {
+    const prefixes = lines
+      .filter((x) => x.startsWith("ref-prefix "))
+      .map((x) => x.slice(11));
+    const list = refs(r).filter(
+      ([name]) => !prefixes.length || prefixes.some((p) => name.startsWith(p)),
+    );
+    const head = r.branch.get("main");
+    const out: Buffer[] = [];
+    if (
+      (!prefixes.length || prefixes.some((p) => "HEAD".startsWith(p))) &&
+      head
+    )
+      out.push(pkt(`${head} HEAD symref-target:refs/heads/main\n`));
+    for (const [name, oid] of list)
+      out.push(
+        pkt(`${oid} ${name}${peel(r, oid) ? ` peeled:${peel(r, oid)}` : ""}\n`),
+      );
+    out.push(flush());
+    return Buffer.concat(out);
+  }
+  const wants = lines
+    .filter((x) => x.startsWith("want "))
+    .map((x) => x.slice(5).split(" ")[0]);
+  const haves = new Set(
+    lines.filter((x) => x.startsWith("have ")).map((x) => x.slice(5)),
+  );
+  const boundaries = new Set(
+    lines.filter((x) => x.startsWith("shallow ")).map((x) => x.slice(8)),
+  );
+  const held = new Set<string>();
+  const markHeld = (oid: string) => {
+    if (held.has(oid)) return;
+    held.add(oid);
+    const object = r.objects.get(oid);
+    if (object) {
+      const children = objectRefs(object);
+      for (const child of object.type === "commit" && boundaries.has(oid)
+        ? children.slice(0, 1)
+        : children)
+        markHeld(child);
+    }
+  };
+  haves.forEach(markHeld);
+  const depth = Number(
+    lines.find((x) => x.startsWith("deepen "))?.slice(7) ?? 0,
+  );
+  const wanted = new Set<string>();
+  const shallow: string[] = [];
+  const unshallow: string[] = [];
+  const take = (oid: string, remaining: number) => {
+    if (wanted.has(oid) || (held.has(oid) && !boundaries.has(oid))) return;
+    const alreadyHeld = held.has(oid);
+    if (!alreadyHeld) wanted.add(oid);
+    const object = r.objects.get(oid);
+    if (object?.type === "commit") {
+      const [tree, ...parents] = objectRefs(object);
+      if (alreadyHeld && boundaries.has(oid) && (!depth || remaining > 1))
+        unshallow.push(oid);
+      if (tree) take(tree, remaining);
+      if (depth && remaining <= 1) {
+        if (!alreadyHeld) shallow.push(oid);
+      } else parents.forEach((p) => take(p, remaining - 1));
+      return;
+    }
+    if (object) for (const child of objectRefs(object)) take(child, remaining);
+  };
+  wants.forEach((oid) => take(oid, depth || Number.MAX_SAFE_INTEGER));
+  const objects = [...wanted].flatMap((oid) => {
+    const value = r.objects.get(oid);
+    return value ? [value] : [];
+  });
+  if (!objects.length)
+    return v2
+      ? Buffer.concat([pkt("packfile\n"), flush()])
+      : Buffer.concat([pkt("NAK\n"), flush()]);
+  const packed = writePack(objects);
+  if (v2)
+    return Buffer.concat([
+      ...(shallow.length || unshallow.length
+        ? [
+            pkt("shallow-info\n"),
+            ...unshallow.map((oid) => pkt(`unshallow ${oid}\n`)),
+            ...shallow.map((oid) => pkt(`shallow ${oid}\n`)),
+            flush(),
+          ]
+        : []),
+      pkt("packfile\n"),
+      sideband(packed),
+      flush(),
+    ]);
+  return Buffer.concat([
+    ...shallow.map((oid) => pkt(`shallow ${oid}\n`)),
+    pkt("NAK\n"),
+    sideband(packed),
+    flush(),
+  ]);
+}
+function receive(r: Repo, raw: Buffer): Buffer {
+  const end = packetPrefixEnd(raw);
+  const commands = packets(raw.subarray(0, end)).map((line) =>
+    line.toString("utf8").replace(/\n$/, ""),
+  );
+  const parsed = commands.map((line) => {
+    const [oldOid, newOid, name] = line.split("\0", 1)[0].split(" ");
+    return { oldOid, newOid, name };
+  });
+  let unpackError = "ok";
+  if (raw.length > end)
+    try {
+      unpack(r, raw.subarray(end));
+    } catch (error) {
+      unpackError = error instanceof Error ? error.message : "unpack error";
+    }
+  const report = [`unpack ${unpackError}`];
+  for (const command of parsed) {
+    const current =
+      r.branch.get(command.name.replace(/^refs\/heads\//, "")) ?? ZERO;
+    let reason = "";
+    if (unpackError !== "ok") reason = "unpacker error";
+    else if (current !== command.oldOid) reason = "stale info";
+    else if (command.newOid !== ZERO && !r.objects.has(command.newOid))
+      reason = "missing object";
+    else if (
+      command.newOid !== ZERO &&
+      command.oldOid !== ZERO &&
+      !isAncestor(r, command.oldOid, command.newOid)
+    )
+      reason = "non-fast-forward";
+    if (reason) report.push(`ng ${command.name} ${reason}`);
+    else {
+      if (command.newOid === ZERO)
+        r.branch.delete(command.name.replace(/^refs\/heads\//, ""));
+      else
+        r.branch.set(
+          command.name.replace(/^refs\/heads\//, ""),
+          command.newOid,
+        );
+      report.push(`ok ${command.name}`);
+    }
+  }
+  const framed = Buffer.concat([
+    ...report.map((line) => pkt(`${line}\n`)),
+    flush(),
+  ]);
+  return sideband(framed);
+}
+async function git(
+  req: IncomingMessage,
+  res: ServerResponse,
+  u: URL,
+): Promise<void> {
+  const match = u.pathname.match(
+    /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/,
+  );
+  if (!match) return fail(res, 404, "Not Found");
+  const r = repos.get(
+    `${decodeURIComponent(match[1])}/${decodeURIComponent(match[2])}`,
+  );
+  if (!r) return fail(res, 404, "Not Found");
+  const action = match[3],
+    service = u.searchParams.get("service") ?? action;
+  if (action === "info/refs")
+    return gitReply(
+      res,
+      "advertisement",
+      service,
+      advertisement(r, service, req.headers["git-protocol"] === "version=2"),
+    );
+  const raw = await gitRaw(req);
+  const v2 = req.headers["git-protocol"] === "version=2";
+  if (action === "git-upload-pack")
+    return gitReply(res, "result", action, upload(r, raw, v2));
+  return gitReply(res, "result", action, receive(r, raw));
 }
 export function createApp(): Server {
   return createServer(
@@ -753,6 +1406,7 @@ export function createApp(): Server {
         const u = url(req);
         if (req.method === "GET" && u.pathname === "/healthz")
           return reply(res, 200, { ok: true });
+        if (/\.git\//.test(u.pathname)) return git(req, res, u);
         if (u.pathname.startsWith("/api/v3")) return rest(req, res, u);
         if (req.method === "POST" && u.pathname === "/api/graphql")
           return graphql(req, res);

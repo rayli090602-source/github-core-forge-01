@@ -1,5 +1,6 @@
 .makefun-private/
 .tools/
+.tmp/
 makefun-heartbeat.md
 makefun-requirements.json
 makefun-skill.md

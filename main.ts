@@ -7,4 +7,3 @@ try {
   reportEntryFailure(error);
   process.exitCode = 1;
 }
-
